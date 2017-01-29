@@ -4,6 +4,7 @@ Mount an OCFS2 filesystem for shared usage
 
 ### Requirements
 
+* Host kernel support for recent versions of the OCFS2 file system (RancherOS tested with kernel-extras)
 * Network IP address and hostname for each node (private network recommended)
 * Pre-partitioned and OCFS2-formatted block device attached to each node at the same location (ex. `/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0-part1` or `/dev/disk/by-label/rancher-ocfs2`)
 
@@ -52,7 +53,7 @@ driver  unmount  mountpoint
 attach, detach functions don't do anything.  
 
 ### Usage
-Rancher hosts will have default backing device environment variable set identifying default block device.  Driver will use it to mount OCFS2 filesystem and create a directory for each volume during create command and delete it at delete command.
+Rancher hosts will have default backing device environment variable set identifying default block device.  Driver will use it to mount OCFS2 filesystem and create a directory for each volume during create command and delete it at delete command.  Directory is bind mounted to appropriate Rancher volume location on container start and unmounted on container stop.
 
 For instance:
 ```
