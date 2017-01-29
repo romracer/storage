@@ -1,0 +1,380 @@
+#!/bin/bash
+
+# Notes:
+#  - Please install "jq" package before using this driver.
+
+if [ -e "$(dirname $0)/common.sh" ]; then
+    source $(dirname $0)/common.sh
+elif [ -e "$(dirname $0)/../common/common.sh" ]; then
+    source $(dirname $0)/../common/common.sh
+fi
+
+OCFS2_MOUNTPOINT=/mnt/dockvols
+CLUSTER_STACK_FILE=/sys/fs/ocfs2/cluster_stack
+LOADED_PLUGINS_FILE=/sys/fs/ocfs2/loaded_cluster_plugins
+
+check_envvars()
+{
+    local num=$1
+    local envvar=$2
+
+    # check environment variable exists for each host ip
+    local tmp
+    for ((i=1;i<=${num};i++)); do
+        tmp="${envvar}${i}"
+        if [ -z "${!tmp}" ]; then
+            return $i
+        fi
+    done
+
+    return 0
+}
+
+write_cluster_config()
+{
+    local num=$1
+    local clustername=$2
+
+    # write header
+    cat > /etc/ocfs2/cluster.conf <<EOF
+cluster:
+    node_count = ${num}
+    name = ${clustername}
+    heartbeat_mode = local
+EOF
+
+    # write section for each host
+    local ip
+    local name
+    for ((i=1;i<=${num};i++)); do
+        ip="HOST_IP$i"
+        name="HOST_NAME$i"
+        cat >> /etc/ocfs2/cluster.conf <<EOF
+node:
+    ip_port = 7777
+    ip_address = ${!ip}
+    number = ${i}
+    name = ${!name}
+    cluster = ${clustername}
+EOF
+    done
+}
+
+configfs_path()
+{
+    # Note that this is only valid *after* configfs is loaded
+    if [ -d /sys/kernel/config ]; then
+        echo /sys/kernel/config
+    else
+        echo /config
+    fi
+}
+
+driver_filesystem()
+{
+    FSNAME="$1"
+    PSEUDO="$2"
+
+    FSOUT="$(awk '(NF == 1 && $1 ~ /^'$FSNAME'$/) || $2 ~ /^'$FSNAME'$/{
+                      print $1;exit
+                  }' /proc/filesystems 2>/dev/null)"
+
+    test -n "$FSOUT"
+    return $?
+}
+
+check_filesystem()
+{
+    FSNAME="$1"
+    MOUNTPOINT="$2"
+
+    FULL_MOUNTSEARCH="`echo "$MOUNTPOINT" | sed -e 's/\//\\\\\//g'`"
+    MOUNTOUT="`awk '$2 ~ /^'$FULL_MOUNTSEARCH'$/ && $3 ~ /^'$FSNAME'$/{print $2; exit}' /proc/mounts 2>/dev/null`"
+
+    test -n "$MOUNTOUT"
+    return $?
+}
+
+load_o2cb()
+{
+    # check and load configfs kernel module
+    if ! driver_filesystem configfs; then
+        modprobe -q configfs
+        rc=$?
+        if [ $rc != 0 ]; then
+            print_error "Failed to load kernel module configfs"
+        fi
+    fi
+
+    # mount the configfs file system
+    local error
+    if ! check_filesystem configfs "$(configfs_path)"; then
+        error=`mount -t configfs configfs "$(configfs_path)"`
+        rc=$?
+        if [ $rc != 0 ]; then
+            print_error "Failed to mount configfs at $(configfs_path): ${error}"
+        fi
+    fi
+
+    # For a newer driver, if ocfs2_stackglue is loaded, we'll see
+    # CLUSTER_STACK_FILE.  Thus, we can determine what mode we're in.
+    [ ! -e "$CLUSTER_STACK_FILE" ] && modprobe -q ocfs2_stackglue
+
+    # If we're a newer driver, CLUSTER_STACK_FILE will now appear
+    # NB. we only support the newer driver
+    if [ -e "$CLUSTER_STACK_FILE" ]; then
+        SP_OUT="$(awk '/^'o2cb'$/{print; exit}' "$LOADED_PLUGINS_FILE" 2>/dev/null)"
+        if [ -z "$SP_OUT" ]; then
+            modprobe -q ocfs2_stack_o2cb
+            rc=$?
+            if [ $rc != 0 ]; then
+                print_error "Failed to load kernel module ocfs2_stack_o2cb"
+            fi
+        fi
+    else
+        print_error "Failed to load cluster stack kernel module"
+    fi
+
+    # load ocfs2_dlmfs kernel module
+    if ! driver_filesystem ocfs2_dlmfs; then
+        modprobe -q ocfs2_dlmfs
+        rc=$?
+        if [ $rc != 0 ]; then
+            print_error "Failed to load kernel module ocfs2_dlmfs"
+        fi
+    fi
+
+    # mount ocfs2_dlmfs at /dlm
+    # NB. /dlm should be a host-backed volume in the container, ex. -v /dlm:/dlm
+    if ! check_filesystem ocfs2_dlmfs /dlm; then
+        error=`mount -t ocfs2_dlmfs ocfs2_dlmfs /dlm`
+        rc=$?
+        if [ $rc != 0 ]; then
+            print_error "Failed to mount ocfs2_dlmfs at /dlm: ${error}"
+        fi
+    fi
+}
+
+check_online_o2cb()
+{
+    CLUSTER="$1"
+
+    RC=0
+    if [ -d "$(configfs_path)/cluster/${CLUSTER}/node/" ]; then
+        ls -1 "$(configfs_path)/cluster/${CLUSTER}/node/" | while read NODE; do
+            LOCAL="`cat \"$(configfs_path)/cluster/${CLUSTER}/node/${NODE}/local\"`"
+            if [ $LOCAL = 1 ]; then
+                return 2
+            fi
+        done
+        if [ $? = 2 ]; then
+            RC=2
+        fi
+    fi
+    return $RC
+}
+
+online_o2cb()
+{
+    CLUSTER="$1"
+
+    OUTPUT="`o2cb_ctl -H -n "${CLUSTER}" -t cluster -a online=yes 2>&1`"
+    if [ $? = 0 ]; then
+        set_timeouts
+        return
+    else
+        o2cb_ctl -H -n "${CLUSTER}" -t cluster -a online=no 2>&1
+        print_error "Failure onlining cluster ${CLUSTER}: ${OUTPUT}"
+    fi
+}
+
+set_timeouts()
+{
+    source /etc/default/o2cb
+
+    O2CB_HEARTBEAT_THRESHOLD_FILE_OLD=/proc/fs/ocfs2_nodemanager/hb_dead_threshold
+    O2CB_HEARTBEAT_THRESHOLD_FILE=$(configfs_path)/cluster/${CLUSTER}/heartbeat/dead_threshold
+    if [ -n "$O2CB_HEARTBEAT_THRESHOLD" ]; then
+        if [ -f "$O2CB_HEARTBEAT_THRESHOLD_FILE" ]; then
+            echo "$O2CB_HEARTBEAT_THRESHOLD" > "$O2CB_HEARTBEAT_THRESHOLD_FILE"
+        elif [ -f "$O2CB_HEARTBEAT_THRESHOLD_FILE_OLD" ]; then
+            echo "$O2CB_HEARTBEAT_THRESHOLD" > "$O2CB_HEARTBEAT_THRESHOLD_FILE_OLD"
+        fi
+    fi
+
+    O2CB_IDLE_TIMEOUT_MS_FILE=$(configfs_path)/cluster/${CLUSTER}/idle_timeout_ms
+    if [ -n "$O2CB_IDLE_TIMEOUT_MS" ]; then
+        if [ -f "$O2CB_IDLE_TIMEOUT_MS_FILE" ]; then
+            echo "$O2CB_IDLE_TIMEOUT_MS" > "$O2CB_IDLE_TIMEOUT_MS_FILE"
+        fi
+    fi
+
+    O2CB_KEEPALIVE_DELAY_MS_FILE=$(configfs_path)/cluster/${CLUSTER}/keepalive_delay_ms
+    if [ -n "$O2CB_KEEPALIVE_DELAY_MS" ]; then
+        if [ -f "$O2CB_KEEPALIVE_DELAY_MS_FILE" ]; then
+            echo "$O2CB_KEEPALIVE_DELAY_MS" > "$O2CB_KEEPALIVE_DELAY_MS_FILE"
+        fi
+    fi
+
+    O2CB_RECONNECT_DELAY_MS_FILE=$(configfs_path)/cluster/${CLUSTER}/reconnect_delay_ms
+    if [ -n "$O2CB_RECONNECT_DELAY_MS" ]; then
+        if [ -f "$O2CB_RECONNECT_DELAY_MS_FILE" ]; then
+            echo "$O2CB_RECONNECT_DELAY_MS" > "$O2CB_RECONNECT_DELAY_MS_FILE"
+        fi
+    fi
+}
+
+mount_ocfs2_filesystem()
+{
+    local mntSrc=$1
+    local mntDest=$2
+
+    # mount remote share if not mounted already
+    if [ $(ismounted "${mntDest}") == 0 ] ; then
+        mkdir -p "${mntDest}"
+        local error
+        error=`mount -t ocfs2 "${mntSrc}" "${mntDest}" 2>&1`
+        if [ $? -ne 0 ]; then
+            print_error "Failed mount ${mntSrc} ${mntDest}: ${error}"
+        fi
+    fi
+}
+
+init()
+{
+    # get number of hosts from environment variable
+    if [ -z "${NUMBER_OF_HOSTS}" ]; then
+        print_error "Failure: No environment variable NUMBER_OF_HOSTS found"
+    fi
+    if [ "${NUMBER_OF_HOSTS}" -gt 16 ]; then
+        print_error "Failure: Maximum of 16 hosts supported"
+    fi
+    if [ -z "${CLUSTER_NAME}" ]; then
+        print_error "Failure: No environment variable CLUSTER_NAME found"
+    fi
+    if [ -z "${BACKING_DEVICE}" ]; then
+        print_error "Failure: No environment variable BACKING_DEVICE found"
+    fi
+
+    local rc
+    local envvar
+    for envvar in HOST_IP HOST_NAME; do
+        check_envvars "${NUMBER_OF_HOSTS}" "${envvar}"
+        rc=$?
+        if [ $rc != 0 ]; then
+            print_error "Failure: No environment variable ${envvar}${rc} found"
+        fi
+    done
+
+    mkdir -p /etc/ocfs2
+    write_cluster_config "${NUMBER_OF_HOSTS}" "${CLUSTER_NAME}"
+
+    mkdir -p /dlm
+    load_o2cb
+
+    check_online_o2cb "${CLUSTER_NAME}"
+    rc=$?
+    if [ $rc != 2 ]; then
+        echo o2cb > "${CLUSTER_STACK_FILE}"
+    fi
+
+    online_o2cb "${CLUSTER_NAME}"
+
+    mount_ocfs2_filesystem "${BACKING_DEVICE}" "${OCFS2_MOUNTPOINT}"
+
+    print_success
+}
+
+create()
+{
+    # The OPTS variable will be populated from the input JSON as a map of key/values
+    if [ -z "${OPTS[name]}" ]; then
+        print_error "Failed: name is required"
+    fi
+
+    # create sub-directory using name parameter to represent volume
+    local subDir="${OCFS2_MOUNTPOINT}"/"${OPTS[name]}"
+    local created=0
+    if [ ! -d "${subDir}" ]; then
+        mkdir -p "${subDir}"
+        created=1
+    fi
+
+    if [ "${created}" == 1 ]; then
+        print_options created true name ${OPTS[name]}
+    else
+        print_success
+    fi
+}
+
+delete()
+{
+    # The OPTS variable will be populated from the input JSON as a map of key/values
+    if [ -z "${OPTS[created]}" ]; then
+        print_success
+        exit 0
+    fi
+
+    if [ -z "${OPTS[name]}" ]; then
+        print_error "Failed: name is required"
+    fi
+
+    # delete sub-directory using name parameter to represent volume
+    local subDir="${OCFS2_MOUNTPOINT}"/"${OPTS[name]}"
+    if [ -d "$subDir" ]; then
+        rm -rf "${subDir}"
+    fi
+
+    print_success
+}
+
+attach()
+{
+    # The OPTS variable will be populated from the input JSON as a map of key/values
+    print_not_supported
+}
+
+detach()
+{
+    # ${DEVICE} will be set with the device that should be detached
+    print_not_supported
+}
+
+mountdest()
+{
+    # ${MNT_DEST} will be set with the directory where the filesystem should be mounted
+    # ${DEVICE} will be the device returned from attach, if any
+    # ${OPTS} will be populated with the options from the JSON input
+    if [ -z "${OPTS[name]}" ]; then
+        print_error "Failed: name is required"
+    fi
+
+    mntSrc="${OCFS2_MOUNTPOINT}"/"${OPTS[name]}"
+    if [ $(ismounted "${MNT_DEST}") == 0 ] ; then
+        mkdir -p "${MNT_DEST}"
+        local error
+        error=`mount --bind ${mntSrc} ${MNT_DEST} 2>&1`
+        if [ $? -ne 0 ]; then
+            print_error "Failed bind mount ${mntSrc} ${MNT_DEST}: ${error}"
+        fi
+    fi
+
+    print_success
+}
+
+unmount()
+{
+    # ${MNT_DEST} will be set with the directory from which the filesystem should be unmounted
+    if [ $(ismounted "${MNT_DEST}") == 1 ] ; then
+        local error
+        error=`umount "${MNT_DEST}" 2>&1`
+        if [ $? -ne 0 ]; then
+            print_error "Failed umount ${MNT_DEST}: ${error}"
+        fi
+    fi
+
+    print_success
+}
+
+# Every script must call main as such
+main "$@"
