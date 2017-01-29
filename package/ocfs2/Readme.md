@@ -59,7 +59,7 @@ For instance:
 export BACKING_DEVICE=/dev/disk/by-label/rancher-ocfs2
 ```
 
-##### Create command
+#### Create command
 user supplies volume name, driver creates a directory under default mount point using volume name.
 The output is the status and newly created directory name
 
@@ -73,7 +73,7 @@ stdout output: {"status": "Success”,"options":{"created":true,"name":"vol1”}
 the options map from the output will be passed in as part of json_input for delete command
 ```
 
-##### Delete command
+#### Delete command
 driver deletes created directory at create phase
 
 ```
