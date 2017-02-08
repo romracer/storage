@@ -17,7 +17,7 @@ $ docker run -it --rm --privileged -v /dev:/host/dev romracer/storage-ocfs2:v0.6
 # parted --script /dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0 \
     mklabel gpt \
     mkpart primary 1MiB 100\%
-# mkfs.ocfs2 --node-slots 16 --label rancher-ocfs2 -T mail --fs-feature-level=max-features --mount cluster --cluster-stack=o2cb --cluster-name=rancherocfs2 /dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0-part1
+# mkfs.ocfs2 --node-slots 16 --label rancher-ocfs2 -T mail --fs-feature-level=max-features --mount cluster --cluster-stack=o2cb --cluster-name=rancherocfs2 --force /dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0-part1
 # exit
 ```
 You might need to re-read the block device on your nodes now:
